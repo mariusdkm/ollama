@@ -71,8 +71,33 @@ func NewServer(modelName string, mode ModelMode) (*Server, error) {
 		exe = eval
 	}
 
-	// Spawn subprocess: ollama runner --imagegen-engine --model <path> --port <port>
-	cmd := exec.Command(exe, "runner", "--imagegen-engine", "--model", modelName, "--port", strconv.Itoa(port))
+	// Load manifest early for VRAM estimation and architecture detection
+	var vramSize uint64
+	modelManifest, manifestErr := manifest.LoadManifest(modelName)
+	if manifestErr == nil {
+		vramSize = uint64(modelManifest.TotalTensorSize())
+	} else {
+		if mode == ModeLLM {
+			// LLM models require manifest to determine engine routing (--mlx-engine vs --imagegen-engine)
+			return nil, fmt.Errorf("failed to load model manifest: %w", manifestErr)
+		}
+		// For image gen, manifest is only used for VRAM estimation — use default
+		slog.Warn("failed to load manifest, using default VRAM estimate", "error", manifestErr)
+		vramSize = 8 * 1024 * 1024 * 1024
+	}
+
+	// Select engine based on model architecture
+	engineFlag := "--imagegen-engine"
+	if mode == ModeLLM {
+		var err error
+		engineFlag, err = mlxEngineFlag(modelManifest)
+		if err != nil {
+			return nil, fmt.Errorf("MLX engine selection failed: %w", err)
+		}
+	}
+
+	// Spawn subprocess: ollama runner <engine> --model <path> --port <port>
+	cmd := exec.Command(exe, "runner", engineFlag, "--model", modelName, "--port", strconv.Itoa(port))
 	cmd.Env = os.Environ()
 
 	// On Linux, set LD_LIBRARY_PATH to include MLX library directories
@@ -81,6 +106,8 @@ func NewServer(modelName string, mode ModelMode) (*Server, error) {
 		libraryPaths := []string{ml.LibOllamaPath}
 		if mlxDirs, err := filepath.Glob(filepath.Join(ml.LibOllamaPath, "mlx_*")); err == nil {
 			libraryPaths = append(libraryPaths, mlxDirs...)
+		} else {
+			slog.Warn("failed to glob mlx subdirectories", "error", err, "path", ml.LibOllamaPath)
 		}
 
 		// Append existing LD_LIBRARY_PATH if set
@@ -105,13 +132,44 @@ func NewServer(modelName string, mode ModelMode) (*Server, error) {
 		slog.Debug("mlx subprocess library path", "LD_LIBRARY_PATH", pathEnvVal)
 	}
 
-	// Estimate VRAM based on tensor size from manifest
-	var vramSize uint64
-	if modelManifest, err := manifest.LoadManifest(modelName); err == nil {
-		vramSize = uint64(modelManifest.TotalTensorSize())
-	} else {
-		// Fallback: default to 8GB if manifest can't be loaded
-		vramSize = 8 * 1024 * 1024 * 1024
+	// On macOS with MLX engine, propagate OLLAMA_LIBRARY_PATH for dylib loading
+	if runtime.GOOS == "darwin" && engineFlag == "--mlx-engine" {
+		libraryPaths := []string{}
+
+		// Include existing OLLAMA_LIBRARY_PATH
+		if existingPath, ok := os.LookupEnv("OLLAMA_LIBRARY_PATH"); ok {
+			libraryPaths = append(libraryPaths, filepath.SplitList(existingPath)...)
+		}
+
+		// Add ml.LibOllamaPath and its mlx_* subdirectories
+		if ml.LibOllamaPath != "" {
+			libraryPaths = append(libraryPaths, ml.LibOllamaPath)
+			if mlxDirs, err := filepath.Glob(filepath.Join(ml.LibOllamaPath, "mlx_*")); err == nil {
+				libraryPaths = append(libraryPaths, mlxDirs...)
+			} else {
+				slog.Warn("failed to glob mlx subdirectories", "error", err, "path", ml.LibOllamaPath)
+			}
+		}
+
+		// Add executable directory as fallback
+		exeDir := filepath.Dir(exe)
+		libraryPaths = append(libraryPaths, exeDir)
+
+		pathEnvVal := strings.Join(libraryPaths, string(filepath.ListSeparator))
+
+		// Update or add OLLAMA_LIBRARY_PATH in cmd.Env
+		found := false
+		for i := range cmd.Env {
+			if strings.HasPrefix(cmd.Env[i], "OLLAMA_LIBRARY_PATH=") {
+				cmd.Env[i] = "OLLAMA_LIBRARY_PATH=" + pathEnvVal
+				found = true
+				break
+			}
+		}
+		if !found {
+			cmd.Env = append(cmd.Env, "OLLAMA_LIBRARY_PATH="+pathEnvVal)
+		}
+		slog.Debug("mlx subprocess library path", "OLLAMA_LIBRARY_PATH", pathEnvVal)
 	}
 
 	s := &Server{
@@ -469,3 +527,35 @@ func (s *Server) HasExited() bool {
 
 // Ensure Server implements llm.LlamaServer
 var _ llm.LlamaServer = (*Server)(nil)
+
+// mlxRunnerArchitectures maps HuggingFace architecture names to whether they're
+// supported by the MLX runner (x/mlxrunner). Models with these architectures
+// get routed to --mlx-engine instead of --imagegen-engine.
+var mlxRunnerArchitectures = map[string]bool{
+	"Qwen2ForCausalLM": true,
+}
+
+// mlxEngineFlag reads config.json from the model manifest and returns the
+// appropriate engine flag based on the model's architecture.
+func mlxEngineFlag(m *manifest.ModelManifest) (string, error) {
+	var config struct {
+		Architectures []string `json:"architectures"`
+	}
+	if err := m.ReadConfigJSON("config.json", &config); err != nil {
+		return "", fmt.Errorf("reading config.json: %w", err)
+	}
+	if len(config.Architectures) == 0 {
+		return "", fmt.Errorf("config.json has no architectures field")
+	}
+	if len(config.Architectures) > 1 {
+		slog.Warn("config.json has multiple architectures, using first", "architectures", config.Architectures)
+	}
+
+	arch := config.Architectures[0]
+	if mlxRunnerArchitectures[arch] {
+		slog.Info("detected mlxrunner-supported architecture", "architecture", arch)
+		return "--mlx-engine", nil
+	}
+	slog.Debug("architecture not in mlxrunner map, using imagegen engine", "architecture", arch)
+	return "--imagegen-engine", nil
+}

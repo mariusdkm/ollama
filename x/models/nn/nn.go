@@ -95,6 +95,11 @@ func (rn *RMSNorm) Forward(x *mlx.Array, eps float32) *mlx.Array {
 	return mlx.RMSNormFn(x, rn.Weight, eps)
 }
 
+// EmbeddingLayer is an interface for embedding layers (both regular and quantized).
+type EmbeddingLayer interface {
+	Forward(indices *mlx.Array) *mlx.Array
+}
+
 // Embedding represents an embedding layer.
 type Embedding struct {
 	Weight *mlx.Array
@@ -106,6 +111,37 @@ func NewEmbedding(weight *mlx.Array) *Embedding {
 
 func (e *Embedding) Forward(indices *mlx.Array) *mlx.Array {
 	return e.Weight.TakeAxis(indices, 0)
+}
+
+// QuantizedEmbedding represents a quantized embedding layer that dequantizes on lookup.
+type QuantizedEmbedding struct {
+	Weight    *mlx.Array
+	Scales    *mlx.Array
+	Biases    *mlx.Array
+	GroupSize int
+	Bits      int
+	Mode      string
+}
+
+func NewQuantizedEmbedding(weight, scales, biases *mlx.Array, groupSize, bits int, mode string) *QuantizedEmbedding {
+	return &QuantizedEmbedding{
+		Weight:    weight,
+		Scales:    scales,
+		Biases:    biases,
+		GroupSize: groupSize,
+		Bits:      bits,
+		Mode:      mode,
+	}
+}
+
+func (e *QuantizedEmbedding) Forward(indices *mlx.Array) *mlx.Array {
+	w := e.Weight.TakeAxis(indices, 0)
+	s := e.Scales.TakeAxis(indices, 0)
+	var b *mlx.Array
+	if e.Biases != nil {
+		b = e.Biases.TakeAxis(indices, 0)
+	}
+	return mlx.Dequantize(w, s, b, e.GroupSize, e.Bits, e.Mode)
 }
 
 // LayerNorm represents a standard layer normalization layer (with bias).

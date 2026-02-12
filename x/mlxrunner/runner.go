@@ -19,6 +19,7 @@ import (
 	"github.com/ollama/ollama/x/mlxrunner/mlx"
 	"github.com/ollama/ollama/x/mlxrunner/sample"
 	"github.com/ollama/ollama/x/models/glm4_moe_lite"
+	"github.com/ollama/ollama/x/models/qwen2"
 )
 
 // TextModel is the interface that model implementations must satisfy.
@@ -73,6 +74,10 @@ type Runner struct {
 }
 
 func (r *Runner) Load(modelName string) error {
+	if !mlx.Loaded() {
+		return fmt.Errorf("MLX C library not loaded — set OLLAMA_LIBRARY_PATH to the directory containing libmlxc.dylib")
+	}
+
 	modelManifest, err := manifest.LoadManifest(modelName)
 	if err != nil {
 		return err
@@ -102,6 +107,13 @@ func (r *Runner) Load(modelName string) error {
 		model, err := glm4_moe_lite.LoadFromManifest(modelManifest)
 		if err != nil {
 			return fmt.Errorf("failed to load GLM4-MoE-Lite model: %w", err)
+		}
+		r.Model = model
+		r.Tokenizer = model.Tokenizer()
+	case "Qwen2ForCausalLM":
+		model, err := qwen2.LoadFromManifest(modelManifest)
+		if err != nil {
+			return fmt.Errorf("failed to load Qwen2 model: %w", err)
 		}
 		r.Model = model
 		r.Tokenizer = model.Tokenizer()

@@ -33,44 +33,69 @@ func init() {
 		return
 	}
 
-	paths, ok := os.LookupEnv("OLLAMA_LIBRARY_PATH")
-	if !ok {
-		slog.Debug("OLLAMA_LIBRARY_PATH not set, skipping mlx dynamic loading")
+	// Build search paths: OLLAMA_LIBRARY_PATH dirs + executable-relative fallback
+	var searchPaths []string
+	if paths, ok := os.LookupEnv("OLLAMA_LIBRARY_PATH"); ok {
+		searchPaths = append(searchPaths, filepath.SplitList(paths)...)
+	}
+
+	// Fallback: directory containing the current executable (production installs)
+	if exe, err := os.Executable(); err == nil {
+		if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+			searchPaths = append(searchPaths, filepath.Dir(resolved))
+		}
+	}
+
+	if len(searchPaths) == 0 {
+		slog.Debug("no MLX library search paths available, skipping mlx dynamic loading")
 		return
 	}
 
-	for _, path := range filepath.SplitList(paths) {
-		matches, err := fs.Glob(os.DirFS(path), "libmlxc.*")
+	for _, dir := range searchPaths {
+		matches, err := fs.Glob(os.DirFS(dir), "libmlxc.*")
 		if err != nil {
-			initError = fmt.Errorf("failed to glob for MLX libraries in %s: %w", path, err)
-			slog.Warn("MLX dynamic library not available", "error", initError)
-			return
+			slog.Error("failed to glob MLX library directory", "dir", dir, "error", err)
+			continue
 		}
 
 		for _, match := range matches {
-			path := filepath.Join(paths, match)
-			slog.Info("Loading MLX dynamic library", "path", path)
+			libPath := filepath.Join(dir, match)
+			slog.Info("Loading MLX dynamic library", "path", libPath)
 
-			cPath := C.CString(path)
+			cPath := C.CString(libPath)
 			defer C.free(unsafe.Pointer(cPath))
 
 			var handle C.mlx_dynamic_handle
 			if C.mlx_dynamic_load(&handle, cPath) != 0 {
-				slog.Error("Failed to load MLX dynamic library", "path", path)
+				slog.Error("Failed to load MLX dynamic library", "path", libPath)
 				continue
 			}
 
 			if C.mlx_dynamic_load_symbols(handle) != 0 {
-				slog.Error("Failed to load MLX dynamic library symbols", "path", path)
+				slog.Error("Failed to load MLX dynamic library symbols", "path", libPath)
 				C.mlx_dynamic_unload(&handle)
 				continue
 			}
 
-			slog.Info("Loaded MLX dynamic library", "path", path)
+			slog.Info("Loaded MLX dynamic library", "path", libPath)
+			mlxLoaded = true
 			return
 		}
 	}
 
-	initError = fmt.Errorf("failed to load any MLX dynamic library from OLLAMA_LIBRARY_PATH=%s", paths)
+	initError = fmt.Errorf("failed to load any MLX dynamic library from search paths: %v", searchPaths)
 	slog.Warn("MLX dynamic library not available", "error", initError)
+	// Don't panic — this binary serves multiple purposes (server, client, runner).
+	// The MLX library is only needed when actually running as the mlxrunner subprocess.
+	// Callers that need MLX should check mlxLoaded before using C functions.
+	slog.Debug("MLX dynamic library not found, mlxrunner functions unavailable", "searched", searchPaths)
+}
+
+// mlxLoaded tracks whether the MLX C library was successfully loaded.
+var mlxLoaded bool
+
+// Loaded returns whether the MLX C library was successfully loaded.
+// Callers should check this before invoking any CGO MLX functions.
+func Loaded() bool {
+	return mlxLoaded
 }

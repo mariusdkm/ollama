@@ -49,7 +49,9 @@ func Execute(args []string) error {
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v1/status", func(w http.ResponseWriter, r *http.Request) {
+
+	// Health/status — used by imagegen wrapper's Ping() and WaitUntilRunning()
+	statusHandler := func(w http.ResponseWriter, r *http.Request) {
 		if err := json.NewEncoder(w).Encode(map[string]any{
 			"status":   0,
 			"progress": 100,
@@ -58,7 +60,9 @@ func Execute(args []string) error {
 			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 			return
 		}
-	})
+	}
+	mux.HandleFunc("GET /v1/status", statusHandler)
+	mux.HandleFunc("GET /health", statusHandler)
 
 	mux.HandleFunc("/v1/models", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
@@ -76,8 +80,11 @@ func Execute(args []string) error {
 			// TODO: cleanup model and cache
 		}
 	})
+	mux.Handle("POST /load", http.RedirectHandler("/v1/models", http.StatusPermanentRedirect))
 
-	mux.HandleFunc("POST /v1/completions", func(w http.ResponseWriter, r *http.Request) {
+	// Completions — used by imagegen wrapper's Completion()
+	// Direct handlers instead of 308 redirects to avoid POST body issues
+	completionsHandler := func(w http.ResponseWriter, r *http.Request) {
 		request := Request{Responses: make(chan Response)}
 
 		if err := json.NewDecoder(r.Body).Decode(&request.TextCompletionsRequest); err != nil {
@@ -114,32 +121,44 @@ func Execute(args []string) error {
 				f.Flush()
 			}
 		}
-	})
+	}
+	mux.HandleFunc("POST /v1/completions", completionsHandler)
+	mux.HandleFunc("POST /completion", completionsHandler)
 
-	mux.HandleFunc("POST /v1/tokenize", func(w http.ResponseWriter, r *http.Request) {
-		var b bytes.Buffer
-		if _, err := io.Copy(&b, r.Body); err != nil {
-			slog.Error("Failed to read request body", "error", err)
-			http.Error(w, "Bad Request", http.StatusBadRequest)
-			return
+	// Tokenize — used by imagegen wrapper's Tokenize()
+	// Accepts JSON {"content":"..."} (wrapper format) and returns {"tokens":[...]}
+	tokenizeHandler := func(w http.ResponseWriter, r *http.Request) {
+		var content string
+		if r.Header.Get("Content-Type") == "application/json" {
+			var req struct {
+				Content string `json:"content"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				http.Error(w, "Bad Request", http.StatusBadRequest)
+				return
+			}
+			content = req.Content
+		} else {
+			var b bytes.Buffer
+			if _, err := io.Copy(&b, r.Body); err != nil {
+				http.Error(w, "Bad Request", http.StatusBadRequest)
+				return
+			}
+			content = b.String()
 		}
 
-		tokens := runner.Tokenizer.Encode(b.String(), true)
+		tokens := runner.Tokenizer.Encode(content, true)
 
-		if err := json.NewEncoder(w).Encode(tokens); err != nil {
+		if err := json.NewEncoder(w).Encode(struct {
+			Tokens []int32 `json:"tokens"`
+		}{Tokens: tokens}); err != nil {
 			slog.Error("Failed to encode response", "error", err)
 			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 			return
 		}
-	})
-
-	for source, target := range map[string]string{
-		"GET /health":      "/v1/status",
-		"POST /load":       "/v1/models",
-		"POST /completion": "/v1/completions",
-	} {
-		mux.Handle(source, http.RedirectHandler(target, http.StatusPermanentRedirect))
 	}
+	mux.HandleFunc("POST /v1/tokenize", tokenizeHandler)
+	mux.HandleFunc("POST /tokenize", tokenizeHandler)
 
 	return runner.Run("127.0.0.1", strconv.Itoa(port), http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
